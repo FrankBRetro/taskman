@@ -34,8 +34,13 @@ Usage: `fload.app [-i seconds] [-n]`. `-n` turns off the idle meter.
 
 ## Download
 
-Ready-built 68000 programs are attached to the
-[latest release](../../releases/latest).
+Ready-built 68000 programs are in [`bin/`](bin):
+
+- [`bin/taskman.app`](bin/taskman.app): TaskMan
+- [`bin/fload.app`](bin/fload.app): FLoad
+
+They run on the ST, STE, TT and Falcon under MultiTOS or FreeMiNT. Copy
+them to your system and run them.
 
 ## Building
 

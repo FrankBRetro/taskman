@@ -1,4 +1,5 @@
 *.app
+!bin/*.app
 *.o
 .DS_Store
 _to_delete/
