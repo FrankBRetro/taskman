@@ -1,4 +1,4 @@
-# TaskMan and FLoad
+# TaskMan, FLoad and FPulse
 
 GEM system monitors for the Atari ST, STE, TT and Falcon running
 **MultiTOS** or **FreeMiNT**.
@@ -32,12 +32,24 @@ A GEM take on X11 `xload`: a resizable window with a scrolling CPU graph and the
 
 Usage: `fload.app [-i seconds] [-n]`. `-n` turns off the idle meter.
 
+## FPulse
+
+**CPU** and **Memory** in one resizable window, in two views (View menu):
+
+- **Bars** (the default): two vertical segmented bars side by side in square housings, CPU in blue with kernel (system) time in red at the bottom, and Memory in green, each with its percentage underneath.
+- **VU Meters**: two analogue VU meters, each with a heading such as "CPU 70%", a thin red second needle on the CPU meter for kernel time, a scale from 0 to 100 with a red zone from 80, and a detail line showing the user/system split or memory used out of the total. They sit side by side, or stacked when the window is taller than it is wide.
+- The window opens in the bottom-right corner of the screen showing only the meters. Click it to bring up the title bar and gadgets for moving or resizing; they hide again when another window takes the focus. Turn this off with View > Hide Window Bars.
+- The Rate menu offers the same sample times as TaskMan, from 0.5 to 20 seconds.
+- Colours follow the system palette (light or dark), as in TaskMan.
+- The desk menu entry is **FPULSE**.
+
 ## Download
 
 Ready-built 68000 programs are in [`bin/`](bin):
 
 - [`bin/taskman.app`](bin/taskman.app): TaskMan
 - [`bin/fload.app`](bin/fload.app): FLoad
+- [`bin/fpulse.app`](bin/fpulse.app): FPulse
 
 They run on the ST, STE, TT and Falcon under MultiTOS or FreeMiNT. Copy
 them to your system and run them.
@@ -50,6 +62,7 @@ You need the `m68k-atari-mint` cross toolchain (gcc, MiNTLib and gemlib).
 make                    # both programs, 68000 code
 make taskman            # TaskMan only
 make fload              # FLoad only (built in FLOAD/)
+make fpulse             # FPulse only (built in FPULSE/)
 make CPU=-m68020-60     # 68020-68060
 make CPU=-mcpu=5475     # FireBee / ColdFire
 ```
