@@ -33,8 +33,12 @@
  * user times are read in supervisor mode.
  *
  * Menu bar: FPULSE (About, desk accessories), File (Quit), View (Bars,
- * VU Meters, Hide Window Bars), Rate (sample interval 0.5 - 20 s, as in
- * TaskMan).
+ * VU Meters, Hide Window Bars, Hide AES), Rate (sample interval 0.5 -
+ * 20 s, as in TaskMan).
+ *
+ * Hide AES (on by default) counts the AES process (AESSYS on MultiTOS,
+ * or XaAES, N.AES, MyAES) and the ALERT accessory as idle, so the CPU
+ * meter shows what the programs are using rather than polling.
  *
  * The window opens in the bottom right corner of the screen.  With Hide
  * Window Bars on (the default), it shows only the meters until clicked;
@@ -126,12 +130,38 @@ typedef struct {
     short pid;
     long  addr;
     unsigned long sys, usr, psys, pusr;
+    int   aes;                  /* part of the AES (View > Hide AES)  */
     int   have_prev, seen;
     unsigned char raw[PROCREC];
 } PROC;
 
 static PROC  procs[MAXPROC];
 static int   nproc;
+static int   hide_aes = 1;              /* View > Hide AES (default on) */
+
+/* The AES runs as an ordinary MiNT process: AESSYS (MultiTOS), XaAES,
+ * N.AES or MyAES, matched by name prefix.  ALERT (ALERT.ACC, which polls
+ * constantly) is filtered with it, by exact name only. */
+static int is_aes(const char *name, int len)
+{
+    static const char *pre[] = { "AESSYS", "XAAES", "N_AES", "NAES", "MYAES" };
+    char up[16];
+    int i, j;
+
+    if (len > 15) len = 15;
+    for (i = 0; i < len; i++)
+        up[i] = (name[i] >= 'a' && name[i] <= 'z') ? name[i] - 32 : name[i];
+    up[len] = 0;
+    if (strcmp(up, "ALERT") == 0)
+        return 1;
+    for (i = 0; i < (int)(sizeof pre / sizeof pre[0]); i++) {
+        for (j = 0; pre[i][j] && up[j] == pre[i][j]; j++)
+            ;
+        if (!pre[i][j])
+            return 1;
+    }
+    return 0;
+}
 
 static short cpu_usr, cpu_sys;          /* permille */
 static short mem_pm;                    /* permille of physical RAM used */
@@ -542,6 +572,7 @@ static int scan_procs(void)
             p->pid = pid;
         }
         p->seen = 1;
+        p->aes = is_aes(nm, (int)(dot - nm));
 
         if (!p->addr) {
             long fd;
@@ -593,7 +624,8 @@ static void sample(void)
             if (ds < 0) ds = 0;
             if (du < 0) du = 0;
             sum_all += ds + du;
-            if (p->pid != 0) {          /* pid 0 = idle */
+            /* pid 0 = idle; with Hide AES the AES counts as idle too */
+            if (p->pid != 0 && !(hide_aes && p->aes)) {
                 busy += ds + du;
                 ksys += ds;
             }
@@ -1140,6 +1172,8 @@ static char ms_rate[NRATE][16] = {
 static char ms_mode[NMODE][20] = { "  Bars             ", "  VU Meters        " };
 static char ms_vsep[]    = "-------------------";
 static char ms_hide[]    = "  Hide Window Bars ";
+static char ms_haes[]    = "  Hide AES         ";
+static short mi_haes = -1;
 static short mi_hide = -1;
 static char mt_title[NTITLE][10] = { " FPULSE ", " File ", " View ", " Rate " };
 
@@ -1184,7 +1218,8 @@ static void build_menu(short scr_w, short scr_h)
         lists[2][i] = ms_mode[i];
     lists[2][NMODE] = ms_vsep;
     lists[2][NMODE + 1] = ms_hide;
-    counts[2] = NMODE + 2;
+    lists[2][NMODE + 2] = ms_haes;
+    counts[2] = NMODE + 3;
     for (i = 0; i < NRATE; i++)
         lists[3][i] = ms_rate[i];
     counts[3] = NRATE;
@@ -1223,6 +1258,7 @@ static void build_menu(short scr_w, short scr_h)
             if (k == 1 && i == 0) mi_quit = (short)o;
             if (k == 2 && i < NMODE) mi_mode[i] = (short)o;
             if (lists[k][i] == ms_hide) mi_hide = (short)o;
+            if (lists[k][i] == ms_haes) mi_haes = (short)o;
             if (k == 3) mi_rate[i] = (short)o;
         }
     }
@@ -1240,6 +1276,7 @@ static void sync_menu(void)
     for (i = 0; i < NMODE; i++)
         menu_icheck(mtree, mi_mode[i], mode == i);
     menu_icheck(mtree, mi_hide, hidebars);
+    menu_icheck(mtree, mi_haes, hide_aes);
 }
 
 /* returns 0 to quit */
@@ -1264,6 +1301,10 @@ static int menu_select(short title, short item)
                 sync_menu();
                 redraw_all();
             }
+        if (item == mi_haes) {
+            hide_aes = !hide_aes;       /* takes effect from the next sample */
+            sync_menu();
+        }
         if (item == mi_hide) {
             set_hidebars(!hidebars);
             sync_menu();

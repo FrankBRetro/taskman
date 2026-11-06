@@ -14,7 +14,7 @@ A task manager in the style of a modern activity monitor.
 - **Stop** (SIGTERM), **Kill** (SIGKILL) and **Nice...** for the selected process. Double-click a row to set its nice level.
 - **CPU** and **Memory** meter windows, and scrolling **CPU History** (kernel and user time) and **Memory History** (used and free) graphs.
 - Meters and graphs can be iconified. The icon keeps showing live data, and its title shows the current figure, e.g. "CPU 42%".
-- **View > Hide AES** leaves the AES out of the list and the totals, so you can see what everything except the GUI is using.
+- **View > Hide AES** leaves the AES and the ALERT accessory out of the list and the totals, so you can see what everything else is using.
 - **Light and dark themes.** The startup theme follows the system palette. In 2- to 256-colour modes TaskMan uses the system palette as it is and never changes it. Each colour is the nearest existing one that still contrasts with its background. True-colour modes get exact colours.
 - Sample rate from 0.5 to 20 seconds (Rate menu). Any window can be hidden or shown from the View menu.
 
@@ -39,6 +39,7 @@ Usage: `fload.app [-i seconds] [-n]`. `-n` turns off the idle meter.
 - **Bars** (the default): two vertical segmented bars side by side in square housings, CPU in blue with kernel (system) time in red at the bottom, and Memory in green, each with its percentage underneath.
 - **VU Meters**: two analogue VU meters, each with a heading such as "CPU 70%", a thin red second needle on the CPU meter for kernel time, a scale from 0 to 100 with a red zone from 80, and a detail line showing the user/system split or memory used out of the total. They sit side by side, or stacked when the window is taller than it is wide.
 - The window opens in the bottom-right corner of the screen showing only the meters. Click it to bring up the title bar and gadgets for moving or resizing; they hide again when another window takes the focus. Turn this off with View > Hide Window Bars.
+- **View > Hide AES** (on by default) counts the CPU time of the AES and the ALERT accessory as idle, so the meter shows what your programs are using.
 - The Rate menu offers the same sample times as TaskMan, from 0.5 to 20 seconds.
 - Colours follow the system palette (light or dark), as in TaskMan.
 - The desk menu entry is **FPULSE**.

@@ -39,9 +39,9 @@
  *   CPU % = change in each process's sys+usr time over the sample period.
  *   The MiNT root process (pid 0) runs when nothing else does, so it is
  *   counted as idle.
- *   View > Hide AES removes the AES (AESSYS, XaAES, N.AES, MyAES) from the
- *   list and leaves its CPU time and memory out of the totals and graphs,
- *   so they show what everything except the GUI is using.
+ *   View > Hide AES removes the AES (AESSYS, XaAES, N.AES, MyAES) and the
+ *   ALERT accessory from the list and leaves their CPU time and memory out
+ *   of the totals and graphs, so they show what everything else is using.
  *
  * Colours: light and dark themes (toolbar switch or View menu); the start-up
  * theme follows the system palette (light when colour 0 is light).  In
@@ -228,11 +228,20 @@ static int   nrows;             /* rows in the list (after filtering)  */
 static int   hide_aes;          /* View > Hide AES                     */
 
 /* the AES (and its desktop thread) runs as an ordinary MiNT process;
- * recognise it by name: MultiTOS AESSYS, XaAES, N.AES, MyAES */
+ * recognise it by name: MultiTOS AESSYS, XaAES, N.AES, MyAES (prefix),
+ * plus the ALERT accessory, which polls constantly (exact name) */
 static int is_aes(const char *name)
 {
     static const char *aes_names[] = { "AESSYS", "XAAES", "N_AES", "NAES", "MYAES" };
     int i, j;
+
+    for (j = 0; "ALERT"[j]; j++) {
+        char c = name[j];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if (c != "ALERT"[j]) break;
+    }
+    if (!"ALERT"[j] && name[j] == 0)
+        return 1;               /* exact match */
 
     for (i = 0; i < (int)(sizeof aes_names / sizeof aes_names[0]); i++) {
         const char *a = aes_names[i];
