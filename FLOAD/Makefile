@@ -13,7 +13,7 @@ CPU   ?= -m68000
 CFLAGS = $(CPU) -O2 -Wall -fomit-frame-pointer
 LIBS   = -lgem -lm
 
-fload.app: fload.c
+fload.app: fload.c ../magsamp.h
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 	$(STRIP) $@
 

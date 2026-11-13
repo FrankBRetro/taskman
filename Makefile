@@ -21,15 +21,15 @@ taskman: taskman.app
 fload: FLOAD/fload.app
 fpulse: FPULSE/fpulse.app
 
-taskman.app: taskman.c
+taskman.app: taskman.c magsamp.h
 	$(CC) $(CFLAGS) -o $@ $< -lgem
 	$(STRIP) $@
 
-FLOAD/fload.app: FLOAD/fload.c
+FLOAD/fload.app: FLOAD/fload.c magsamp.h
 	$(CC) $(CFLAGS) -o $@ $< -lgem -lm
 	$(STRIP) $@
 
-FPULSE/fpulse.app: FPULSE/fpulse.c
+FPULSE/fpulse.app: FPULSE/fpulse.c magsamp.h
 	$(CC) $(CFLAGS) -o $@ $< -lgem -lm
 	$(STRIP) $@
 

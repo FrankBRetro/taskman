@@ -34,6 +34,9 @@
  *   text/data/BSS and Stop/Kill, greys out Nice and shows CPU as "n/a".
  *   Which data is used is decided per process from what the kernel
  *   answers, so MultiTOS and FreeMiNT behave exactly as before.
+ *   CPU usage under MagiC comes from a statistical sampler (magsamp.h):
+ *   the 200 Hz timer counts which process is running; %CPU per process
+ *   and the CPU totals are marked "sampled".
  *
  * Data source (works on MultiTOS, no u:\kern needed):
  *   u:\proc            one entry "NAME.PID" per process
@@ -74,6 +77,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include "magsamp.h"
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -228,6 +233,7 @@ typedef struct {
     int   probed;               /* u:\proc file queried already       */
     int   have_ppid;            /* ppid known without a MiNT record   */
     short bp_ppid;              /* MagiC: parent's p_procid           */
+    unsigned long ms_prev;      /* MagiC: sampler ticks last time     */
 } TASK;
 
 static TASK  tasks[MAXTASK];
@@ -237,6 +243,10 @@ static int   proc_ok = 1;
 static int   nrows;             /* rows in the list (after filtering)  */
 static int   is_magic;          /* MagiC kernel ('MagX' cookie)        */
 static int   cpu_avail = 1;     /* kernel reports per-process CPU time */
+static int   cpu_sampled;       /* MagiC: CPU from the timer sampler   */
+static unsigned long ms_prev_total, ms_prev_stop;
+static int   ms_primed;
+static volatile int quit_req;   /* SIGTERM etc.: leave cleanly         */
 static int   hide_aes;          /* View > Hide AES                     */
 
 /* the AES (and its desktop thread) runs as an ordinary MiNT process;
@@ -907,6 +917,15 @@ static long read_ramtop(void)
     return 0;
 }
 
+static int bp_alive(unsigned long bp)
+{
+    int i;
+    for (i = 0; i < ntask; i++)
+        if ((unsigned long)tasks[i].bp == bp)
+            return 1;
+    return 0;
+}
+
 static void sample(void)
 {
     long now = now_ms(), dt = now - last_sample_ms;
@@ -993,6 +1012,45 @@ static void sample(void)
     cpu_usr = (short)((busy - ksys) * 1000UL / total);
     if (cpu_sys > 1000) cpu_sys = 1000;
     if (cpu_usr + cpu_sys > 1000) cpu_usr = 1000 - cpu_sys;
+
+    /* MagiC: no kernel accounting, use the timer sampler instead.
+     * programs = ticks in listed processes (AES counts as idle with
+     * Hide AES), idle = nothing to run (MCPU or FMON), kernel = the rest */
+    cpu_sampled = 0;
+    if (!cpu_avail && ms) {
+        unsigned long tot, stp, td, sd;
+        unsigned long matched = 0, user = 0, other;
+
+        ms_read(&tot, &stp);                /* all ticks, idle ticks */
+        td = tot - ms_prev_total;
+        sd = stp - ms_prev_stop;
+
+        for (i = 0; i < ntask; i++) {
+            TASK *t = &tasks[i];
+            unsigned long cur = ms_count((unsigned long)t->bp, t->pid), d;
+            d = cur >= t->ms_prev ? cur - t->ms_prev : cur;
+            if (!ms_primed)
+                d = 0;
+            t->ms_prev = cur;
+            t->cpu = td ? (short)(d * 1000UL / td) : 0;
+            matched += d;
+            if (!hidden(t->name))
+                user += d;
+        }
+        ms_prev_total = tot;
+        ms_prev_stop = stp;
+        if (ms_primed && td > 0) {
+            other = td > sd + matched ? td - sd - matched : 0;
+            cpu_usr = (short)(user * 1000UL / td);
+            cpu_sys = (short)(other * 1000UL / td);
+            if (cpu_usr > 1000) cpu_usr = 1000;
+            if (cpu_usr + cpu_sys > 1000) cpu_sys = 1000 - cpu_usr;
+            cpu_avail = 1;
+            cpu_sampled = 1;
+        }
+        ms_primed = 1;
+        ms_tidy(bp_alive);
+    }
 
     h_usr[h_head] = cpu_usr;
     h_sys[h_head] = cpu_sys;
@@ -1339,7 +1397,8 @@ static void cell_text(const TASK *t, int key, char *s, int *c, int plain)
     default: s[0] = 0;
     }
     if (!t->addr && ((key == K_PPID && !t->have_ppid) || key == K_NICE ||
-                     key == K_STATE || key == K_CPU || key == K_TIME)) {
+                     key == K_STATE || (key == K_CPU && !cpu_sampled) ||
+                     key == K_TIME)) {
         strcpy(s, "-");
         if (plain)
             *c = C_DIM;                 /* placeholders in grey */
@@ -1419,7 +1478,7 @@ static void meter_bar(short x, short y, short xr, short yb, long part, long tota
 static void draw_footer(const TLAYOUT *L)
 {
     const GRECT *f = &L->foot;
-    short lh = hchar + 2, y = f->g_y + 6, x1 = f->g_x + wchar, x2;
+    short lh = hchar + 2, y = f->g_y + 6, x1 = f->g_x + wchar, x2, head_end;
     char a[24], b[24], s[64];
     long phys = mem_st + mem_tt;
 
@@ -1474,9 +1533,11 @@ static void draw_footer(const TLAYOUT *L)
         return;
     }
 
-    /* CPU block */
+    /* CPU block; "sampled" goes with the LOAD label, so the heading stays
+     * short enough not to run into it */
     sprintf(s, hide_aes ? "CPU  (%d tasks, no AES)" : "CPU  (%d tasks)", nrows);
     txt(C_DIM, x2, y, s, 0);
+    head_end = x2 + ((short)strlen(s) + 1) * wchar;
     if (!cpu_avail) {
         txt(C_TEXT, x2, y + lh, "Usage:  n/a", 0);
         txt(C_DIM, x2, y + 2 * lh,
@@ -1508,7 +1569,15 @@ static void draw_footer(const TLAYOUT *L)
             box(C_USR, bx + 1 + ws, by + 1, bx + wu, byb - 1);
             fr.g_x = bx; fr.g_y = by; fr.g_w = bxr - bx + 1; fr.g_h = byb - by + 1;
             frame(C_GRID, &fr);
-            txt(C_DIM, bx, y, "LOAD", 0);
+            {
+                /* label above the bar, after the heading, if it fits */
+                const char *lab = cpu_sampled ? "LOAD (sampled)" : "LOAD";
+                short lx = bx > head_end ? bx : head_end;
+                if (lx + (short)strlen(lab) * wchar > bxr + 1)
+                    lab = "LOAD";
+                if (lx + 4 * wchar <= bxr + 1)
+                    txt(C_DIM, lx, y, lab, 0);
+            }
         }
     }
 }
@@ -2628,6 +2697,12 @@ static int handle_message(short *msg)
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 
+static void on_quit_signal(int sig)
+{
+    (void)sig;
+    quit_req = 1;
+}
+
 int main(void)
 {
     short work_in[11], work_out[57];
@@ -2662,6 +2737,11 @@ int main(void)
     wind_get(0, WF_WORKXYWH, &desk.g_x, &desk.g_y, &desk.g_w, &desk.g_h);
     my_pid = (short)Pgetpid();
     is_magic = have_cookie(0x4D616758L);    /* 'MagX' */
+    if (is_magic)
+        ms_attach();                        /* CPU sampler (shared) */
+    signal(SIGTERM, on_quit_signal);
+    signal(SIGINT, on_quit_signal);
+    signal(SIGHUP, on_quit_signal);
 
     last_sample_ms = now_ms();
     sample();                               /* baseline times */
@@ -2669,6 +2749,7 @@ int main(void)
 
     if (!proc_ok) {
         form_alert(1, "[3][TaskMan needs MultiTOS,|FreeMiNT or MagiC:|u:\\proc not found.][ Quit ]");
+        ms_detach();
         v_clsvwk(vh);
         appl_exit();
         return 1;
@@ -2690,6 +2771,7 @@ int main(void)
 
     if (!open_win(W_TASKS)) {
         menu_bar(mtree, 0);
+        ms_detach();
         v_clsvwk(vh);
         appl_exit();
         return 1;
@@ -2714,6 +2796,8 @@ int main(void)
 
         if (ev & MU_MESAG)
             running = handle_message(msg);
+        if (quit_req)
+            running = 0;
 
         if (running && (ev & MU_BUTTON)) {
             short h = wind_find(mx, my);
@@ -2760,6 +2844,7 @@ int main(void)
     for (i = NWIN - 1; i >= 0; i--)
         close_win(i);
     menu_bar(mtree, 0);
+    ms_detach();
     v_clsvwk(vh);
     appl_exit();
     return 0;

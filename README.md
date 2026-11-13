@@ -46,13 +46,21 @@ Usage: `fload.app [-i seconds] [-n]`. `-n` turns off the idle meter.
 
 ## MagiC
 
-All three programs also support **MagiC**, following the MagiC 6 developer documentation. MagiC has a `u:\proc` directory, but it keeps no CPU time or priority per process, so:
+All three programs also support **MagiC**, following the MagiC 6 developer documentation. MagiC has a `u:\proc` directory but keeps no CPU time or priority per process. So under MagiC the monitors measure CPU use by sampling, 200 times a second, which process is running. They use the same method as MSHELL's `ps` and `top`:
 
-- **TaskMan** lists every process with its PID, parent PID (taken from the basepage), memory and text/data/BSS sizes. Stop and Kill work. Nice is greyed out, and the CPU columns, meter and graph show **n/a**.
-- **FPulse** shows memory as usual, with the CPU bar or meter marked **n/a**.
-- **FLoad** graphs memory in use instead of CPU load (title "[MagiC: memory]").
+- **With MSHELL's `MCPU.PRG` installed** (resident, for example from the AUTO folder): the monitors read its counts through the `MCPU` cookie and install nothing themselves.
+- **Otherwise:** they install their own sampler (`magsamp.h`, XBRA id `FMON`) on the 200 Hz system timer. It is shared by TaskMan, FPulse and FLoad and removed when the last of them quits. It lives in memory MagiC never frees, so a killed monitor can't leave the timer pointing at freed memory.
+- **Idle:** in both cases, a tick counts as idle when MagiC's dispatcher has nothing to run (the AES ready list `act_appl` is empty). Otherwise it belongs to the running process (`act_pd`). This also works on MagicOnLinux, whose idle loop never executes STOP.
 
-On MultiTOS and FreeMiNT nothing changes.
+What each program shows:
+
+- **TaskMan** lists every process with its PID, parent PID (from the basepage), memory, text/data/BSS sizes and a sampled **% CPU**. The totals are marked "sampled". Stop and Kill work. Nice is greyed out (MagiC has no priorities), and CPU time and state show "-".
+- **FPulse** shows sampled CPU (user in blue, kernel in red) and memory.
+- **FLoad** graphs sampled CPU, with averages of CPU busy as its load line.
+
+If the timer can't be sampled, TaskMan and FPulse show CPU as **n/a**, and FLoad graphs memory in use instead.
+
+On MultiTOS and FreeMiNT nothing changes: they keep using the kernel's own accounting.
 
 ## Download
 

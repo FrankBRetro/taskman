@@ -13,7 +13,7 @@ CPU   ?= -m68000
 CFLAGS = $(CPU) -O2 -Wall -fomit-frame-pointer
 LIBS   = -lgem -lm
 
-fpulse.app: fpulse.c
+fpulse.app: fpulse.c ../magsamp.h
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 	$(STRIP) $@
 

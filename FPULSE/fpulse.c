@@ -29,7 +29,9 @@
  * with a red zone from 80, and a needle.
  *
  * MagiC has u:\proc but no per-process CPU time (Fcntl(PPROCADDR) is not
- * supported), so there the CPU meter shows "n/a"; memory works as usual.
+ * supported).  There the CPU figures come from a statistical sampler on
+ * the 200 Hz timer (magsamp.h, shared with TaskMan and FLoad); if the
+ * timer cannot be sampled the CPU meter shows "n/a".
  *
  * Data comes from u:\proc (MultiTOS and FreeMiNT, no u:\kern needed):
  * Fcntl(PPROCADDR) gives each process's kernel record, whose system and
@@ -65,6 +67,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <signal.h>
+#include "../magsamp.h"
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -75,6 +79,9 @@
 
 #ifndef PPROCADDR
 #define PPROCADDR   0x5001
+#endif
+#ifndef PBASEADDR
+#define PBASEADDR   0x5002
 #endif
 #ifndef AP_TERM
 #define AP_TERM     50
@@ -135,6 +142,8 @@ typedef struct {
     unsigned long sys, usr, psys, pusr;
     int   aes;                  /* part of the AES (View > Hide AES)  */
     int   probed;               /* u:\proc file queried already       */
+    long  bp;                   /* basepage (MagiC sampler)           */
+    unsigned long ms_prev;      /* MagiC: sampler ticks last time     */
     int   have_prev, seen;
     unsigned char raw[PROCREC];
 } PROC;
@@ -173,6 +182,11 @@ static long  mem_phys, mem_free;
 static int   have_data;
 static int   cpu_avail = 1;             /* kernel reports CPU time per process */
 static int   is_magic;                  /* MagiC: no per-process CPU time      */
+static unsigned long ms_prev_total, ms_prev_stop;
+static int   ms_primed;
+static volatile int quit_req;           /* SIGTERM etc.: leave cleanly         */
+
+static int bp_alive(unsigned long bp);
 
 /* ------------------------------------------------------------------ */
 /* Colours                                                             */
@@ -596,9 +610,11 @@ static int scan_procs(void)
             sprintf(path, "u:\\proc\\%s", nm);
             fd = Fopen(path, 0);
             if (fd >= 0) {
-                long a = 0;
+                long a = 0, bp = 0;
                 if (Fcntl((short)fd, (long)&a, PPROCADDR) == 0)
                     p->addr = a;
+                if (Fcntl((short)fd, (long)&bp, PBASEADDR) == 0)
+                    p->bp = bp;
                 Fclose((short)fd);
             }
             p->have_prev = 0;
@@ -613,6 +629,15 @@ static int scan_procs(void)
         }
     nproc = j;
     return 1;
+}
+
+static int bp_alive(unsigned long bp)
+{
+    int i;
+    for (i = 0; i < nproc; i++)
+        if ((unsigned long)procs[i].bp == bp)
+            return 1;
+    return 0;
 }
 
 static void sample(void)
@@ -665,6 +690,42 @@ static void sample(void)
     cpu_usr = (short)((busy - ksys) * 1000UL / total);
     if (cpu_sys > 1000) cpu_sys = 1000;
     if (cpu_usr + cpu_sys > 1000) cpu_usr = 1000 - cpu_sys;
+
+    /* MagiC: no kernel accounting, use the shared timer sampler.
+     * user = ticks in listed processes (the AES counts as idle with
+     * Hide AES), idle = nothing to run (MCPU or FMON), kernel = the rest */
+    if (!cpu_avail && ms) {
+        unsigned long tot, stp, td, sd;
+        unsigned long matched = 0, user = 0, other;
+
+        ms_read(&tot, &stp);                /* all ticks, idle ticks */
+        td = tot - ms_prev_total;
+        sd = stp - ms_prev_stop;
+
+        for (i = 0; i < nproc; i++) {
+            PROC *p = &procs[i];
+            unsigned long cur = ms_count((unsigned long)p->bp, p->pid), d;
+            d = cur >= p->ms_prev ? cur - p->ms_prev : cur;
+            if (!ms_primed)
+                d = 0;
+            p->ms_prev = cur;
+            matched += d;
+            if (!(hide_aes && p->aes))
+                user += d;
+        }
+        ms_prev_total = tot;
+        ms_prev_stop = stp;
+        if (ms_primed && td > 0) {
+            other = td > sd + matched ? td - sd - matched : 0;
+            cpu_usr = (short)(user * 1000UL / td);
+            cpu_sys = (short)(other * 1000UL / td);
+            if (cpu_usr > 1000) cpu_usr = 1000;
+            if (cpu_usr + cpu_sys > 1000) cpu_sys = 1000 - cpu_usr;
+            cpu_avail = 1;
+        }
+        ms_primed = 1;
+        ms_tidy(bp_alive);
+    }
 
     /* memory */
     st = Supexec(read_phystop);
@@ -1408,6 +1469,12 @@ static int handle_message(short *msg)
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 
+static void on_quit_signal(int sig)
+{
+    (void)sig;
+    quit_req = 1;
+}
+
 int main(void)
 {
     short work_in[11], work_out[57];
@@ -1442,10 +1509,16 @@ int main(void)
     wind_get(0, WF_WORKXYWH, &desk.g_x, &desk.g_y, &desk.g_w, &desk.g_h);
 
     is_magic = (int)Supexec(magx_cookie);
+    if (is_magic)
+        ms_attach();                        /* CPU sampler (shared) */
+    signal(SIGTERM, on_quit_signal);
+    signal(SIGINT, on_quit_signal);
+    signal(SIGHUP, on_quit_signal);
     last_sample_ms = now_ms();
     sample();                               /* baseline process times */
     if (!have_data) {
         form_alert(1, "[3][FPulse needs MultiTOS,|FreeMiNT or MagiC:|u:\\proc not found.][ Quit ]");
+        ms_detach();
         v_clsvwk(vh);
         appl_exit();
         return 1;
@@ -1458,6 +1531,7 @@ int main(void)
     if (!open_window()) {
         form_alert(1, "[3][FPulse: no more windows.][ Quit ]");
         menu_bar(mtree, 0);
+        ms_detach();
         v_clsvwk(vh);
         appl_exit();
         return 1;
@@ -1481,6 +1555,8 @@ int main(void)
 
         if (ev & MU_MESAG)
             running = handle_message(msg);
+        if (quit_req)
+            running = 0;
 
         if (running && (ev & MU_KEYBD) && (key & 0xff) == 0x11)
             running = 0;                    /* Ctrl+Q */
@@ -1506,6 +1582,7 @@ int main(void)
     wind_close(win);
     wind_delete(win);
     menu_bar(mtree, 0);
+    ms_detach();
     v_clsvwk(vh);
     appl_exit();
     return 0;

@@ -14,8 +14,11 @@
  *   - integer grid lines whenever the load average goes above 1.0
  *   - info line shows CPU % (usr/sys) and the 1/5/15 minute load averages
  *
- * MagiC has no CPU time, load average or process priorities, so there
- * FLoad graphs memory in use instead (title "[MagiC: memory]").
+ * MagiC has no CPU time, load average or process priorities.  There FLoad
+ * samples the 200 Hz timer to see which process is running (magsamp.h,
+ * shared with TaskMan and FPulse; title "[MagiC: sampled/avg]"), and the
+ * line shows averages of CPU busy.  If the timer cannot be sampled it
+ * graphs memory in use instead (title "[MagiC: memory]").
  *
  * Data sources (best available is chosen at runtime, shown in title):
  *   CPU  : u:\kern\stat (FreeMiNT) - with user/sys split       "kern"
@@ -39,6 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <signal.h>
+#include "../magsamp.h"
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
@@ -202,7 +207,7 @@ static long find_mint_cookie(void)
 /*       LD_AVG      1/5/15 minute averages of measured CPU busy       */
 /* ------------------------------------------------------------------ */
 
-enum { CPU_NONE, CPU_KERN, CPU_SPIN, CPU_MEM };
+enum { CPU_NONE, CPU_KERN, CPU_SPIN, CPU_MEM, CPU_MSAMP };
 enum { LD_NONE, LD_SUPTIME, LD_KERN, LD_AVG };
 
 static int cpu_src = CPU_NONE, ld_src = LD_NONE;
@@ -395,6 +400,153 @@ static void update_avg(long busy, long dt_ms)
     avg_valid = 1;
 }
 
+/* --- MagiC: CPU from the shared timer sampler (magsamp.h) ----------- */
+#ifndef PBASEADDR
+#define PBASEADDR   0x5002
+#endif
+#define MP_MAX      96
+
+typedef struct {
+    short pid;
+    int   seen, probed, aes;
+    long  bp;
+    unsigned long prev;
+} MPROC;
+
+static MPROC mp[MP_MAX];
+static int   nmp, ms_primed, name_changed;
+static unsigned long ms_prev_total, ms_prev_stop;
+static volatile int quit_req;
+
+/* the AES and the ALERT accessory count as idle, as in FPulse */
+static int mp_is_aes(const char *n, int len)
+{
+    static const char *pre[] = { "AESSYS", "XAAES", "N_AES", "NAES", "MYAES" };
+    char up[16];
+    int i, j;
+    if (len > 15) len = 15;
+    for (i = 0; i < len; i++)
+        up[i] = (n[i] >= 'a' && n[i] <= 'z') ? n[i] - 32 : n[i];
+    up[len] = 0;
+    if (strcmp(up, "ALERT") == 0)
+        return 1;
+    for (i = 0; i < 5; i++) {
+        for (j = 0; pre[i][j] && up[j] == pre[i][j]; j++)
+            ;
+        if (!pre[i][j])
+            return 1;
+    }
+    return 0;
+}
+
+static void mp_scan(void)
+{
+    char buf[64], path[48];
+    long dh;
+    int i, j;
+
+    for (i = 0; i < nmp; i++)
+        mp[i].seen = 0;
+    dh = Dopendir("u:\\proc", 0);
+    if (dh < 0)
+        return;
+    while (Dreaddir(sizeof buf, dh, buf) == 0) {
+        char *nm = buf + 4, *dot = strrchr(nm, '.');
+        short pid;
+        MPROC *p = NULL;
+        if (nm[0] == '.' || !dot || dot == nm)
+            continue;
+        pid = (short)atoi(dot + 1);
+        for (i = 0; i < nmp; i++)
+            if (mp[i].pid == pid) { p = &mp[i]; break; }
+        if (!p) {
+            if (nmp >= MP_MAX)
+                continue;
+            p = &mp[nmp++];
+            memset(p, 0, sizeof *p);
+            p->pid = pid;
+        }
+        p->seen = 1;
+        p->aes = mp_is_aes(nm, (int)(dot - nm));
+        if (!p->probed) {
+            long fd, bp = 0;
+            p->probed = 1;
+            sprintf(path, "u:\\proc\\%s", nm);
+            fd = Fopen(path, 0);
+            if (fd >= 0) {
+                if (Fcntl((short)fd, (long)&bp, PBASEADDR) == 0)
+                    p->bp = bp;
+                Fclose((short)fd);
+            }
+        }
+    }
+    Dclosedir(dh);
+    for (i = j = 0; i < nmp; i++)
+        if (mp[i].seen) {
+            if (i != j) mp[j] = mp[i];
+            j++;
+        }
+    nmp = j;
+}
+
+static int mp_alive(unsigned long bp)
+{
+    int i;
+    for (i = 0; i < nmp; i++)
+        if ((unsigned long)mp[i].bp == bp)
+            return 1;
+    return 0;
+}
+
+/* user and kernel share of the last period (FSCALE units);
+ * returns 0 if the timer is not being sampled */
+static int msamp_sample(long *us, long *sy)
+{
+    unsigned long tot, stp, td, sd;
+    unsigned long matched = 0, user = 0, other;
+    int i, primed = ms_primed;
+
+    ms_read(&tot, &stp);                /* all ticks, idle ticks */
+    td = tot - ms_prev_total;
+    sd = stp - ms_prev_stop;
+
+    mp_scan();
+    for (i = 0; i < nmp; i++) {
+        unsigned long cur = ms_count((unsigned long)mp[i].bp, mp[i].pid), d;
+        d = cur >= mp[i].prev ? cur - mp[i].prev : cur;
+        if (!primed)
+            d = 0;
+        mp[i].prev = cur;
+        matched += d;
+        if (!mp[i].aes)
+            user += d;
+    }
+    ms_prev_total = tot;
+    ms_prev_stop = stp;
+    ms_primed = 1;
+    ms_tidy(mp_alive);
+    if (!primed)
+        return 1;                       /* first call: baseline only */
+    if (td == 0)
+        return 0;
+    other = td > sd + matched ? td - sd - matched : 0;
+    *us = (long)(user * FSCALE / td);
+    *sy = (long)(other * FSCALE / td);
+    return 1;
+}
+
+static void cleanup(void)
+{
+    stop_spinner();
+    ms_detach();
+}
+
+static void on_quit_signal(int sig)
+{
+    (void)sig;
+    quit_req = 1;
+}
+
 static void init_sources(void)
 {
     unsigned long u, s, j;
@@ -403,12 +555,21 @@ static void init_sources(void)
     is_magic = !mint_version && Supexec(find_magx_cookie);
 
     if (is_magic) {
-        /* MagiC keeps no CPU time and has no load average or process
-         * priorities (so no idle meter either): show memory instead */
-        cpu_src = CPU_MEM;
-        ld_src = LD_NONE;
+        /* MagiC keeps no CPU time, load average or priorities: sample
+         * the timer (shared with TaskMan and FPulse); if that is not
+         * possible, show memory in use instead */
         last_sample_ms = now_ms();
-        strcpy(win_name, " FLoad  [MagiC: memory] ");
+        if (ms_attach()) {
+            long a, b;
+            cpu_src = CPU_MSAMP;
+            ld_src = LD_AVG;            /* averages of sampled CPU busy */
+            msamp_sample(&a, &b);       /* baseline */
+            strcpy(win_name, " FLoad  [MagiC: sampled/avg] ");
+        } else {
+            cpu_src = CPU_MEM;
+            ld_src = LD_NONE;
+            strcpy(win_name, " FLoad  [MagiC: memory] ");
+        }
         return;
     }
 
@@ -459,6 +620,18 @@ static void sample(void)
         }
     } else if (cpu_src == CPU_SPIN) {
         us = spin_sample();     /* no user/sys split available */
+    } else if (cpu_src == CPU_MSAMP) {
+        if (!msamp_sample(&us, &sy)) {
+            /* timer not sampled (e.g. an emulator without Timer C):
+             * fall back to the memory graph */
+            ms_detach();
+            cpu_src = CPU_MEM;
+            ld_src = LD_NONE;
+            have_load = 0;
+            strcpy(win_name, " FLoad  [MagiC: memory] ");
+            name_changed = 1;
+            us = mem_sample();
+        }
     } else if (cpu_src == CPU_MEM) {
         us = mem_sample();      /* MagiC: memory in use */
     }
@@ -507,7 +680,7 @@ static void sample(void)
             sprintf(b, "%ld.%ldM", kp / 1024, (kp % 1024) * 10 / 1024);
             sprintf(win_info, " Memory %d%% (%s of %s)  CPU n/a under MagiC",
                     pu, a, b);
-        } else if (cpu_src == CPU_KERN)
+        } else if (cpu_src == CPU_KERN || cpu_src == CPU_MSAMP)
             sprintf(win_info, " CPU %3d%% (usr %d sys %d)  %s",
                     pu + ps, pu, ps, ld);
         else if (cpu_src == CPU_SPIN)
@@ -749,11 +922,15 @@ static int open_window(void)
 {
     GRECT b;
 
+    /* bottom left corner of the desk; the border is placed, not the work
+     * area, so tall title/info bars (MagiC) never end up under the menu */
     wind_calc(WC_BORDER, WKIND,
-              desk.g_x + 16, desk.g_y + 16, INIT_W, INIT_H,
+              desk.g_x, desk.g_y, INIT_W, INIT_H,
               &b.g_x, &b.g_y, &b.g_w, &b.g_h);
     if (b.g_w > desk.g_w) b.g_w = desk.g_w;
     if (b.g_h > desk.g_h) b.g_h = desk.g_h;
+    b.g_x = desk.g_x;
+    b.g_y = desk.g_y + desk.g_h - b.g_h;
 
     win = wind_create(WKIND, desk.g_x, desk.g_y, desk.g_w, desk.g_h);
     if (win < 0)
@@ -836,13 +1013,17 @@ int main(int argc, char *argv[])
         }
     }
 
+    signal(SIGTERM, on_quit_signal);
+    signal(SIGINT, on_quit_signal);
+    signal(SIGHUP, on_quit_signal);
+
     /* before appl_init(), so a forked idle meter never inherits AES state */
     init_sources();
     strcpy(win_info, " Measuring...");
 
     ap_id = appl_init();
     if (ap_id < 0) {
-        stop_spinner();
+        cleanup();
         return 1;
     }
 
@@ -856,7 +1037,7 @@ int main(int argc, char *argv[])
     v_opnvwk(work_in, &vh, work_out);
     if (vh <= 0) {
         form_alert(1, "[3][FLoad: cannot open VDI|workstation.][ Quit ]");
-        stop_spinner();
+        cleanup();
         appl_exit();
         return 1;
     }
@@ -866,7 +1047,7 @@ int main(int argc, char *argv[])
 
     if (!open_window()) {
         form_alert(1, "[3][FLoad: no more windows.][ Quit ]");
-        stop_spinner();
+        cleanup();
         v_clsvwk(vh);
         appl_exit();
         return 1;
@@ -887,6 +1068,8 @@ int main(int argc, char *argv[])
 
         if (ev & MU_MESAG)
             running = handle_message(msg);
+        if (quit_req)
+            running = 0;
 
         if (running && (ev & MU_KEYBD)) {
             short c = key & 0xff;
@@ -896,6 +1079,10 @@ int main(int argc, char *argv[])
 
         if (running && now_ms() >= next) {
             sample();
+            if (name_changed) {
+                wind_set_str(win, WF_NAME, win_name);
+                name_changed = 0;
+            }
             wind_set_str(win, WF_INFO, win_info);
             update_graph();
             next += interval_ms;
@@ -904,7 +1091,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    stop_spinner();
+    cleanup();
     wind_close(win);
     wind_delete(win);
     v_clsvwk(vh);
