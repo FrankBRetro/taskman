@@ -44,6 +44,16 @@ Usage: `fload.app [-i seconds] [-n]`. `-n` turns off the idle meter.
 - Colours follow the system palette (light or dark), as in TaskMan.
 - The desk menu entry is **FPULSE**.
 
+## MagiC
+
+All three programs also support **MagiC**, following the MagiC 6 developer documentation. MagiC has a `u:\proc` directory, but it keeps no CPU time or priority per process, so:
+
+- **TaskMan** lists every process with its PID, parent PID (taken from the basepage), memory and text/data/BSS sizes. Stop and Kill work. Nice is greyed out, and the CPU columns, meter and graph show **n/a**.
+- **FPulse** shows memory as usual, with the CPU bar or meter marked **n/a**.
+- **FLoad** graphs memory in use instead of CPU load (title "[MagiC: memory]").
+
+On MultiTOS and FreeMiNT nothing changes.
+
 ## Download
 
 Ready-built 68000 programs are in [`bin/`](bin):

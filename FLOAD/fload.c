@@ -14,6 +14,9 @@
  *   - integer grid lines whenever the load average goes above 1.0
  *   - info line shows CPU % (usr/sys) and the 1/5/15 minute load averages
  *
+ * MagiC has no CPU time, load average or process priorities, so there
+ * FLoad graphs memory in use instead (title "[MagiC: memory]").
+ *
  * Data sources (best available is chosen at runtime, shown in title):
  *   CPU  : u:\kern\stat (FreeMiNT) - with user/sys split       "kern"
  *          idle meter thread, tfork() (MultiTOS, old MiNT)     "meter"
@@ -135,6 +138,46 @@ static long now_ms(void)
 }
 
 static long mint_version;           /* MiNT cookie, 0 if none */
+static int  is_magic;               /* MagiC ('MagX' cookie) */
+
+static long find_magx_cookie(void)
+{
+    long *jar = *(long **)0x5a0L;
+    if (jar)
+        for (; jar[0]; jar += 2)
+            if (jar[0] == 0x4D616758L)   /* 'MagX' */
+                return 1;
+    return 0;
+}
+
+/* memory in use, for MagiC (no CPU or load figures there) */
+static long read_phystop(void) { return *(volatile long *)0x42eL; }
+static long read_ramtop(void)
+{
+    if (*(volatile long *)0x5a8L == 0x1357BD13L)
+        return *(volatile long *)0x5a4L;
+    return 0;
+}
+
+static long mem_phys, mem_used;
+
+static long mem_sample(void)            /* returns used fraction (FSCALE) */
+{
+    long st = Supexec(read_phystop), tt = Supexec(read_ramtop);
+    long fst, ftt;
+
+    tt = tt > 0x01000000L ? tt - 0x01000000L : 0;
+    fst = (long)Mxalloc(-1L, 0);
+    ftt = tt ? (long)Mxalloc(-1L, 1) : 0;
+    if (fst < 0) fst = 0;
+    if (ftt < 0) ftt = 0;
+    mem_phys = st + tt;
+    mem_used = mem_phys - fst - ftt;
+    if (mem_used < 0) mem_used = 0;
+    if (mem_phys < 1024)
+        return 0;
+    return mem_used / 1024 * FSCALE / (mem_phys / 1024);
+}
 
 static long find_mint_cookie(void)
 {
@@ -153,12 +196,13 @@ static long find_mint_cookie(void)
 /* CPU:  CPU_KERN  u:\kern\stat (FreeMiNT kernfs) - user/sys split      */
 /*       CPU_SPIN  idle meter: lowest-priority child that spins and    */
 /*                 reports how much CPU it got (MultiTOS / old MiNT)   */
+/*       CPU_MEM   MagiC: no CPU figures at all, graph memory in use   */
 /* Load: LD_SUPTIME  Suptime() (FreeMiNT)                              */
 /*       LD_KERN     u:\kern\loadavg                                   */
 /*       LD_AVG      1/5/15 minute averages of measured CPU busy       */
 /* ------------------------------------------------------------------ */
 
-enum { CPU_NONE, CPU_KERN, CPU_SPIN };
+enum { CPU_NONE, CPU_KERN, CPU_SPIN, CPU_MEM };
 enum { LD_NONE, LD_SUPTIME, LD_KERN, LD_AVG };
 
 static int cpu_src = CPU_NONE, ld_src = LD_NONE;
@@ -356,6 +400,17 @@ static void init_sources(void)
     unsigned long u, s, j;
 
     mint_version = Supexec(find_mint_cookie);
+    is_magic = !mint_version && Supexec(find_magx_cookie);
+
+    if (is_magic) {
+        /* MagiC keeps no CPU time and has no load average or process
+         * priorities (so no idle meter either): show memory instead */
+        cpu_src = CPU_MEM;
+        ld_src = LD_NONE;
+        last_sample_ms = now_ms();
+        strcpy(win_name, " FLoad  [MagiC: memory] ");
+        return;
+    }
 
     if (read_kern_stat(&u, &s, &j)) {
         cpu_src = CPU_KERN;
@@ -404,6 +459,8 @@ static void sample(void)
         }
     } else if (cpu_src == CPU_SPIN) {
         us = spin_sample();     /* no user/sys split available */
+    } else if (cpu_src == CPU_MEM) {
+        us = mem_sample();      /* MagiC: memory in use */
     }
 
     if (us < 0) us = 0;
@@ -413,8 +470,10 @@ static void sample(void)
 
     if (ld_src == LD_AVG)
         update_avg(us + sy, dt);
-    else
+    else if (ld_src != LD_NONE || cpu_src != CPU_MEM)
         have_load = read_load();
+    else
+        have_load = 0;
     if (ld_src == LD_AVG)
         have_load = 1;
     if (!have_load)
@@ -441,7 +500,14 @@ static void sample(void)
         else
             strcpy(ld, "Load n/a");
 
-        if (cpu_src == CPU_KERN)
+        if (cpu_src == CPU_MEM) {
+            char a[16], b[16];
+            long ku = (mem_used + 1023) / 1024, kp = (mem_phys + 1023) / 1024;
+            sprintf(a, "%ld.%ldM", ku / 1024, (ku % 1024) * 10 / 1024);
+            sprintf(b, "%ld.%ldM", kp / 1024, (kp % 1024) * 10 / 1024);
+            sprintf(win_info, " Memory %d%% (%s of %s)  CPU n/a under MagiC",
+                    pu, a, b);
+        } else if (cpu_src == CPU_KERN)
             sprintf(win_info, " CPU %3d%% (usr %d sys %d)  %s",
                     pu + ps, pu, ps, ld);
         else if (cpu_src == CPU_SPIN)

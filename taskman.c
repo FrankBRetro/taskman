@@ -28,6 +28,13 @@
  *   the icon shows a live miniature of the window and its title shows the
  *   current figure ("CPU 42%", "Mem 28%"), both updated every sample.
  *
+ * MagiC: u:\proc exists but Fcntl(PPROCADDR) is not supported, so there
+ *   is no CPU time, priority or state per process.  TaskMan then takes the
+ *   parent from the basepage (p_parent -> p_procid at 0x28), keeps memory,
+ *   text/data/BSS and Stop/Kill, greys out Nice and shows CPU as "n/a".
+ *   Which data is used is decided per process from what the kernel
+ *   answers, so MultiTOS and FreeMiNT behave exactly as before.
+ *
  * Data source (works on MultiTOS, no u:\kern needed):
  *   u:\proc            one entry "NAME.PID" per process
  *   Fxattr()           size = memory used by the process
@@ -217,7 +224,10 @@ typedef struct {
     int   have_flags;
     int   bp_state;             /* 0 unread, 1 ok, -1 unusable        */
     long  tlen, dlen, blen, tpa;
-    unsigned char bpraw[32];
+    unsigned char bpraw[48];    /* basepage up to p_procid (MagiC)   */
+    int   probed;               /* u:\proc file queried already       */
+    int   have_ppid;            /* ppid known without a MiNT record   */
+    short bp_ppid;              /* MagiC: parent's p_procid           */
 } TASK;
 
 static TASK  tasks[MAXTASK];
@@ -225,6 +235,8 @@ static int   ntask;
 static short order[MAXTASK];
 static int   proc_ok = 1;
 static int   nrows;             /* rows in the list (after filtering)  */
+static int   is_magic;          /* MagiC kernel ('MagX' cookie)        */
+static int   cpu_avail = 1;     /* kernel reports per-process CPU time */
 static int   hide_aes;          /* View > Hide AES                     */
 
 /* the AES (and its desktop thread) runs as an ordinary MiNT process;
@@ -733,15 +745,42 @@ static TASK *find_task(short pid)
     return NULL;
 }
 
+static long find_cookie_id;
+static long find_cookie_super(void)
+{
+    long *jar = *(long **)0x5a0L;
+    if (jar)
+        for (; jar[0]; jar += 2)
+            if (jar[0] == find_cookie_id)
+                return 1;
+    return 0;
+}
+
+static int have_cookie(long id)
+{
+    find_cookie_id = id;
+    return (int)Supexec(find_cookie_super);
+}
+
 static long read_procs_super(void)
 {
     int i;
     for (i = 0; i < ntask; i++) {
-        if (tasks[i].addr)
-            memcpy(tasks[i].raw, (const void *)tasks[i].addr, PROCREC);
+        TASK *t = &tasks[i];
+        if (t->addr)
+            memcpy(t->raw, (const void *)t->addr, PROCREC);
         /* basepage: read once per process (it does not change) */
-        if (tasks[i].bp_state == 0 && tasks[i].bp && !(tasks[i].bp & 1))
-            memcpy(tasks[i].bpraw, (const void *)tasks[i].bp, 32);
+        if (t->bp_state == 0 && t->bp && !(t->bp & 1)) {
+            memcpy(t->bpraw, (const void *)t->bp, sizeof t->bpraw);
+            /* MagiC keeps the process ID in the basepage (p_procid,
+             * 0x28), so the parent's ID is in the parent's basepage */
+            t->bp_ppid = -1;
+            if (is_magic && !t->addr) {
+                unsigned long par = g32(t->bpraw + 0x24);
+                if (par && !(par & 1))
+                    t->bp_ppid = *(volatile short *)(par + 0x28);
+            }
+        }
     }
     return 0;
 }
@@ -809,8 +848,12 @@ static void scan_procs(void)
         if (len > 15) len = 15;
 
         t = find_task(pid);
-        if (t && (strncmp(t->name, nm, len) != 0 || t->name[len] != 0))
-            t->addr = 0, t->have_prev = 0;      /* pid re-used */
+        if (t && (strncmp(t->name, nm, len) != 0 || t->name[len] != 0)) {
+            t->addr = 0;                        /* pid re-used */
+            t->have_prev = 0;
+            t->probed = 0;
+            t->have_ppid = 0;
+        }
 
         if (!t) {
             if (ntask >= MAXTASK)
@@ -825,8 +868,9 @@ static void scan_procs(void)
 
         sprintf(path, "u:\\proc\\%s", nm);
 
-        if (!t->addr) {
+        if (!t->probed) {
             long fd = Fopen(path, 0);
+            t->probed = 1;
             if (fd >= 0) {
                 long a = 0, bp = 0, fl = 0;
                 if (Fcntl((short)fd, (long)&a, PPROCADDR) == 0)
@@ -873,20 +917,41 @@ static void sample(void)
     scan_procs();
     Supexec(read_procs_super);
 
+    cpu_avail = 0;
     for (i = 0; i < ntask; i++) {
         TASK *t = &tasks[i];
-        if (!t->addr || g16(t->raw + OFF_PID) != t->pid) {
-            t->addr = 0;                /* stale: re-read address next time */
+        parse_basepage(t);
+        if (t->addr && g16(t->raw + OFF_PID) != t->pid) {
+            t->addr = 0;                /* stale: look it up again */
+            t->probed = 0;
             t->have_prev = 0;
+        }
+        if (!t->addr) {
+            /* no MiNT process record (MagiC: PPROCADDR unsupported):
+             * no CPU time, priority or state; parent from the basepage */
             t->cpu = 0;
+            if (is_magic && t->bp_state == 1 &&
+                g16(t->bpraw + 0x28) == t->pid) {
+                unsigned long par = g32(t->bpraw + 0x24);
+                int j;
+                t->ppid = -1;
+                for (j = 0; j < ntask; j++)     /* parent in our list? */
+                    if (tasks[j].bp && (unsigned long)tasks[j].bp == par) {
+                        t->ppid = tasks[j].pid;
+                        break;
+                    }
+                if (t->ppid < 0 && t->bp_ppid >= 0 && t->bp_ppid < 1000)
+                    t->ppid = t->bp_ppid;
+                t->have_ppid = t->ppid >= 0;
+            }
             continue;
         }
+        cpu_avail = 1;
         t->ppid   = g16(t->raw + OFF_PPID);
         t->pri    = g16(t->raw + OFF_PRI);
         t->state  = g16(t->raw + OFF_WAITQ);
         t->curpri = g16(t->raw + OFF_CURPRI);
         t->nice   = -t->pri;
-        parse_basepage(t);
         t->sys    = g32(t->raw + OFF_SYSTIME);
         t->usr    = g32(t->raw + OFF_USRTIME);
 
@@ -1149,8 +1214,12 @@ static void tasks_layout(const GRECT *w, TLAYOUT *L)
 
 static int btn_enabled(int b)
 {
-    (void)b;
-    return sel_pid > 0 && sel_pid != my_pid && find_task(sel_pid) != NULL;
+    TASK *t = find_task(sel_pid);
+    if (!t || sel_pid <= 0 || sel_pid == my_pid)
+        return 0;
+    if (b == B_NICE)                /* MagiC has no priorities */
+        return t->addr != 0;
+    return 1;
 }
 
 static void draw_toolbar(const TLAYOUT *L)
@@ -1269,9 +1338,12 @@ static void cell_text(const TASK *t, int key, char *s, int *c, int plain)
         break;
     default: s[0] = 0;
     }
-    if (!t->addr && (key == K_PPID || key == K_NICE || key == K_STATE ||
-                     key == K_CPU || key == K_TIME))
+    if (!t->addr && ((key == K_PPID && !t->have_ppid) || key == K_NICE ||
+                     key == K_STATE || key == K_CPU || key == K_TIME)) {
         strcpy(s, "-");
+        if (plain)
+            *c = C_DIM;                 /* placeholders in grey */
+    }
 }
 
 static void draw_rows(const TLAYOUT *L, const GRECT *clip)
@@ -1405,6 +1477,13 @@ static void draw_footer(const TLAYOUT *L)
     /* CPU block */
     sprintf(s, hide_aes ? "CPU  (%d tasks, no AES)" : "CPU  (%d tasks)", nrows);
     txt(C_DIM, x2, y, s, 0);
+    if (!cpu_avail) {
+        txt(C_TEXT, x2, y + lh, "Usage:  n/a", 0);
+        txt(C_DIM, x2, y + 2 * lh,
+            is_magic ? "MagiC does not report" : "The kernel does not report", 0);
+        txt(C_DIM, x2, y + 3 * lh, "CPU time per process.", 0);
+        return;
+    }
     fmt_pm(cpu_usr, a);
     sprintf(s, "User:   %s", a);
     txt(C_USR, x2, y + lh, s, 0);
@@ -1451,7 +1530,7 @@ static void draw_tasks(const GRECT *work, const GRECT *clip)
 /* CPU meter window                                                    */
 /* ------------------------------------------------------------------ */
 
-static void draw_meter(const GRECT *w, int red_pm, int total_pm)
+static void draw_meter(const GRECT *w, int red_pm, int total_pm, const char *label)
 {
     short labh = w->g_h >= 3 * hchar + 12 ? hchar + 6 : 0;
     short mx1 = w->g_x + 6, mx2 = w->g_x + w->g_w - 7;
@@ -1478,7 +1557,10 @@ static void draw_meter(const GRECT *w, int red_pm, int total_pm)
     }
 
     if (labh) {
-        fmt_pm(total_pm, s);
+        if (label)
+            strcpy(s, label);
+        else
+            fmt_pm(total_pm, s);
         {
             short tw = (short)strlen(s) * wchar;
             txt(C_TEXT, w->g_x + (w->g_w - tw) / 2, w->g_y + w->g_h - labh + 2, s, 0);
@@ -1488,12 +1570,15 @@ static void draw_meter(const GRECT *w, int red_pm, int total_pm)
 
 static void draw_cpu(const GRECT *w)
 {
-    draw_meter(w, cpu_sys, cpu_sys + cpu_usr);
+    if (cpu_avail)
+        draw_meter(w, cpu_sys, cpu_sys + cpu_usr, NULL);
+    else
+        draw_meter(w, 0, 0, "n/a");
 }
 
 static void draw_mem(const GRECT *w)
 {
-    draw_meter(w, 0, mem_used_pm);
+    draw_meter(w, 0, mem_used_pm, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1528,6 +1613,11 @@ static void draw_hist_label(int win, const GRECT *lab)
         fmt_mem(free_st + free_tt, a);
         sprintf(s, "Free %s", a);
         txt(C_USR, x, lab->g_y + 3, s, 0);
+        return;
+    }
+    if (!cpu_avail) {
+        txt(C_DIM, x, lab->g_y + 3,
+            is_magic ? "CPU usage n/a under MagiC" : "CPU usage not available", 0);
         return;
     }
     fmt_pm(cpu_usr, a);
@@ -1625,10 +1715,13 @@ static void draw_icon(int i, const GRECT *work)
 
     switch (i) {
     case W_CPU:
-        draw_meter(work, cpu_sys, cpu_sys + cpu_usr);
+        if (cpu_avail)
+            draw_meter(work, cpu_sys, cpu_sys + cpu_usr, NULL);
+        else
+            draw_meter(work, 0, 0, NULL);
         break;
     case W_MEM:
-        draw_meter(work, 0, mem_used_pm);
+        draw_meter(work, 0, mem_used_pm, NULL);
         break;
     case W_HIST:
     case W_MHIST:
@@ -1835,7 +1928,10 @@ static void update_icon_title(int i)
 
     if (wins[i].h < 0 || !wins[i].iconified)
         return;
-    sprintf(t, "%s %d%%", (i == W_MEM || i == W_MHIST) ? "Mem" : "CPU", (pm + 5) / 10);
+    if ((i == W_CPU || i == W_HIST) && !cpu_avail)
+        strcpy(t, "CPU n/a");
+    else
+        sprintf(t, "%s %d%%", (i == W_MEM || i == W_MHIST) ? "Mem" : "CPU", (pm + 5) / 10);
     if (strcmp(t, wins[i].ititle) != 0) {
         strcpy(wins[i].ititle, t);
         wind_set_str(wins[i].h, WF_NAME, wins[i].ititle);
@@ -2345,7 +2441,7 @@ static void sync_menu(void)
     en = btn_enabled(B_STOP);
     menu_ienable(mtree, mi(ms_stop), en);
     menu_ienable(mtree, mi(ms_kill), en);
-    menu_ienable(mtree, mi(ms_nice), en);
+    menu_ienable(mtree, mi(ms_nice), btn_enabled(B_NICE));
 }
 
 /* returns 0 to quit */
@@ -2565,13 +2661,14 @@ int main(void)
 
     wind_get(0, WF_WORKXYWH, &desk.g_x, &desk.g_y, &desk.g_w, &desk.g_h);
     my_pid = (short)Pgetpid();
+    is_magic = have_cookie(0x4D616758L);    /* 'MagX' */
 
     last_sample_ms = now_ms();
     sample();                               /* baseline times */
     sort_tasks();
 
     if (!proc_ok) {
-        form_alert(1, "[3][TaskMan needs MiNT|(MultiTOS or FreeMiNT):|u:\\proc not found.][ Quit ]");
+        form_alert(1, "[3][TaskMan needs MultiTOS,|FreeMiNT or MagiC:|u:\\proc not found.][ Quit ]");
         v_clsvwk(vh);
         appl_exit();
         return 1;

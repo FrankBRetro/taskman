@@ -28,6 +28,9 @@
  * Each meter has a heading with its percentage, a scale from 0 to 100
  * with a red zone from 80, and a needle.
  *
+ * MagiC has u:\proc but no per-process CPU time (Fcntl(PPROCADDR) is not
+ * supported), so there the CPU meter shows "n/a"; memory works as usual.
+ *
  * Data comes from u:\proc (MultiTOS and FreeMiNT, no u:\kern needed):
  * Fcntl(PPROCADDR) gives each process's kernel record, whose system and
  * user times are read in supervisor mode.
@@ -131,6 +134,7 @@ typedef struct {
     long  addr;
     unsigned long sys, usr, psys, pusr;
     int   aes;                  /* part of the AES (View > Hide AES)  */
+    int   probed;               /* u:\proc file queried already       */
     int   have_prev, seen;
     unsigned char raw[PROCREC];
 } PROC;
@@ -167,6 +171,8 @@ static short cpu_usr, cpu_sys;          /* permille */
 static short mem_pm;                    /* permille of physical RAM used */
 static long  mem_phys, mem_free;
 static int   have_data;
+static int   cpu_avail = 1;             /* kernel reports CPU time per process */
+static int   is_magic;                  /* MagiC: no per-process CPU time      */
 
 /* ------------------------------------------------------------------ */
 /* Colours                                                             */
@@ -531,6 +537,16 @@ static long read_procs_super(void)
 }
 
 static long read_phystop(void) { return *(volatile long *)0x42eL; }
+
+static long magx_cookie(void)
+{
+    long *jar = *(long **)0x5a0L;
+    if (jar)
+        for (; jar[0]; jar += 2)
+            if (jar[0] == 0x4D616758L)  /* 'MagX' */
+                return 1;
+    return 0;
+}
 static long read_ramtop(void)
 {
     if (*(volatile long *)0x5a8L == 0x1357BD13L)
@@ -574,8 +590,9 @@ static int scan_procs(void)
         p->seen = 1;
         p->aes = is_aes(nm, (int)(dot - nm));
 
-        if (!p->addr) {
+        if (!p->probed) {
             long fd;
+            p->probed = 1;
             sprintf(path, "u:\\proc\\%s", nm);
             fd = Fopen(path, 0);
             if (fd >= 0) {
@@ -609,13 +626,17 @@ static void sample(void)
     ok = scan_procs();
     Supexec(read_procs_super);
 
+    cpu_avail = 0;
     for (i = 0; i < nproc; i++) {
         PROC *p = &procs[i];
-        if (!p->addr || g16(p->raw + OFF_PID) != p->pid) {
+        if (p->addr && g16(p->raw + OFF_PID) != p->pid) {
             p->addr = 0;                /* stale: look it up again */
+            p->probed = 0;
             p->have_prev = 0;
-            continue;
         }
+        if (!p->addr)                   /* MagiC: no process record */
+            continue;
+        cpu_avail = 1;
         p->sys = g32(p->raw + OFF_SYSTIME);
         p->usr = g32(p->raw + OFF_USRTIME);
         if (p->have_prev) {
@@ -732,6 +753,8 @@ static void draw_meter(const METER *m, const GRECT *clip, const char *title,
     if (rect_intersect(clip, &r)) {
         box(C_BG, r.g_x, r.g_y, r.g_x + r.g_w - 1, r.g_y + r.g_h - 1);
         fmt_pct(pm, pct);
+        if (pm < 0)
+            strcpy(pct, "n/a");         /* kernel has no CPU figures */
         sprintf(head, have_data ? "%s %s" : "%s --", title, pct);
         ctext(C_HEAD, m->cell.g_x + m->cell.g_w / 2, m->face.g_y - hchar - 6, head, 1);
         if ((short)strlen(detail) * wchar > m->cell.g_w - 8)
@@ -792,7 +815,7 @@ static void draw_meter(const METER *m, const GRECT *clip, const char *title,
 
 
     /* second, thin needle for kernel time (CPU meter only) */
-    if (have_data && red_pm >= 0) {
+    if (have_data && pm >= 0 && red_pm >= 0) {
         polar(m, red_pm, m->r - 2, &x, &y);
         vsl_color(vh, pen[C_RED]);      /* red that contrasts with the face */
         vsl_width(vh, 1);
@@ -801,7 +824,7 @@ static void draw_meter(const METER *m, const GRECT *clip, const char *title,
     }
 
     /* needle */
-    if (have_data) {
+    if (have_data && pm >= 0) {
         polar(m, pm, m->r + 2, &x, &y);
         vsl_color(vh, pen[C_NEEDLE]);
         vsl_width(vh, m->r >= 40 ? 3 : 1);
@@ -835,7 +858,7 @@ static void draw_bar(short hx, short hw, short hy, short hh, const char *title,
     gap = 1;
     nseg = (hh - 2 * pad + gap) / (seg + gap);
     if (nseg < 1) nseg = 1;
-    lit = (pm * nseg + 500) / 1000;
+    lit = pm > 0 ? (pm * nseg + 500) / 1000 : 0;
     if (pm > 0 && lit == 0) lit = 1;    /* show that something is happening */
     lit_red = (red_pm * nseg + 500) / 1000;
     if (red_pm > 0 && lit_red == 0) lit_red = 1;
@@ -851,6 +874,8 @@ static void draw_bar(short hx, short hw, short hy, short hh, const char *title,
     /* heading above, percentage below */
     ctext(C_HEAD, cx, hy - hchar - 6, title, 0);
     fmt_pct(pm, pct);
+    if (pm < 0)
+        strcpy(pct, "n/a");             /* kernel has no CPU figures */
     ctext(C_HEAD, cx, hy + hh + 5, have_data ? pct : "--", 1);
     if (legend && have_data)
         ctext(C_DIM, cx, hy + hh + hchar + 7, legend, 0);
@@ -877,7 +902,10 @@ static void draw_bars(const GRECT *work, const GRECT *clip)
     if (hh < 16) hh = 16;
 
     /* the red part of the CPU bar is kernel time, the blue part user time */
-    draw_bar(x0, hw, hy, hh, "CPU", cpu_usr + cpu_sys, cpu_sys, C_CPU, NULL);
+    if (cpu_avail)
+        draw_bar(x0, hw, hy, hh, "CPU", cpu_usr + cpu_sys, cpu_sys, C_CPU, NULL);
+    else
+        draw_bar(x0, hw, hy, hh, "CPU", -1, 0, C_CPU, NULL);
     draw_bar(x0 + hw + gap, hw, hy, hh, "Memory", mem_pm, 0, C_MEM, NULL);
 }
 
@@ -917,7 +945,12 @@ static void draw_all(const GRECT *work, const GRECT *clip)
     sprintf(s1, "u%d s%d", (cpu_usr + 5) / 10, (cpu_sys + 5) / 10);
     sprintf(s2, "%s/%s", a, b);
 
-    draw_meter(&ma, clip, "CPU", cpu_usr + cpu_sys, cpu_sys, d1, s1, "CPU %");
+    if (!cpu_avail) {
+        strcpy(d1, is_magic ? "not reported by MagiC" : "not reported");
+        strcpy(s1, "n/a");
+    }
+    draw_meter(&ma, clip, "CPU", cpu_avail ? cpu_usr + cpu_sys : -1, cpu_sys,
+               d1, s1, "CPU %");
     draw_meter(&mb, clip, "Memory", mem_pm, -1, d2, s2, "MEM %");
     }
 }
@@ -1408,10 +1441,11 @@ int main(void)
 
     wind_get(0, WF_WORKXYWH, &desk.g_x, &desk.g_y, &desk.g_w, &desk.g_h);
 
+    is_magic = (int)Supexec(magx_cookie);
     last_sample_ms = now_ms();
     sample();                               /* baseline process times */
     if (!have_data) {
-        form_alert(1, "[3][FPulse needs MiNT|(MultiTOS or FreeMiNT):|u:\\proc not found.][ Quit ]");
+        form_alert(1, "[3][FPulse needs MultiTOS,|FreeMiNT or MagiC:|u:\\proc not found.][ Quit ]");
         v_clsvwk(vh);
         appl_exit();
         return 1;
